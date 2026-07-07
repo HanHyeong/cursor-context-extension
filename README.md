@@ -9,12 +9,52 @@ This is a port and redesign of the [cursor-context](https://github.com/HanHyeong
 | Cursor feature | This extension's counterpart |
 |---|---|
 | Background codebase index | `.cursor-context/project-context.md` — auto-generated doc, injected every session via `before_agent_start` |
-| Merkle-tree change detection | Content fingerprints compared against the **live working tree** |
-| Index refresh on save | 3-tier auto-refresh: on noticed discrepancy / on structural change / 20-commit backstop |
+| Merkle-tree change detection | Content fingerprints (sha256) compared against the **live working tree** |
+| Index refresh on save | 3-tier auto-refresh: on noticed discrepancy / on structural fingerprint change / 20-commit backstop |
 | `.cursorrules` | `CLAUDE.md` / `AGENTS.md` — **user-owned, never touched** |
 | Per-query semantic code search | Delegated to pi's native agentic search (Grep/Glob/bash) |
 
 ---
+
+## How it works
+
+The extension is a single TypeScript module (`src/index.ts`) loaded via [jiti](https://github.com/unjs/jiti), plus 3 markdown-driven skills in `skills/`. Logic is split across focused modules:
+
+| Module | Role |
+|---|---|
+| `src/index.ts` | Extension entry: event handlers (`session_start`, `before_agent_start`, `tool_call`, `agent_end`), custom tools, commands |
+| `src/config.ts` | Constants, paths, env-flag options, legacy-log migration |
+| `src/git.ts` | Single source of truth for fingerprinting, git/fs helpers, freshness verdict |
+| `src/snapshot.ts` | Project-context snapshot builder (stack/tree/git/branch-intent) |
+| `src/metrics.ts` | Metrics collector, feedback log, evolve gate threshold |
+| `src/doc.ts` | Doc write/markers, gitignore enforcement, command verification |
+| `src/benchmark.ts` | Deterministic quality gate (length/markers/commands/paths) |
+| `skills/project-onboard/SKILL.md` | Full doc generation procedure |
+| `skills/context-refresh/SKILL.md` | Incremental doc update procedure |
+| `skills/context-evolve/SKILL.md` | Usage-signal-driven doc improvement procedure |
+
+### Lifecycle mapping (Claude Code bash hooks → pi events)
+
+| Claude Code hook | pi event | What it does |
+|---|---|---|
+| SessionStart | `session_start` | Compute freshness, set footer status, ensure `.gitignore`, migrate legacy logs |
+| UserPromptSubmit | `before_agent_start` | Inject snapshot + freshness verdict + standing rules (per prompt) |
+| PostToolUse | `tool_call` | Append tool-usage metric (in-process, sub-ms) |
+| Stop (evolve gate) | `agent_end` | If signals cross threshold, send follow-up message triggering evolve |
+
+### Freshness verdict (single source of truth)
+
+`freshnessVerdict()` in `src/git.ts` returns a discriminated union instead of exit codes:
+
+```typescript
+type FreshnessVerdict =
+  | { kind: "fresh" }
+  | { kind: "stale"; changed: readonly string[] }
+  | { kind: "unverifiable"; reason: string }
+  | { kind: "no-doc" };
+```
+
+Both the `session_start` cache and the per-prompt `before_agent_start` recompute call this. No drift risk — the bash version re-implemented the comparison in 3 scripts.
 
 ## Install
 
@@ -23,8 +63,10 @@ This is a port and redesign of the [cursor-context](https://github.com/HanHyeong
 ```bash
 git clone <this-repo> cursor-context-extension
 cd cursor-context-extension
-npm install        # installs type-only devDeps
+npm install        # installs type-only devDeps (no build step; loaded via jiti)
 ```
+
+There is no build step — pi loads `src/index.ts` directly via [jiti](https://github.com/unjs/jiti). `npm run check` runs `tsc --noEmit` for type checking only.
 
 Then either:
 
@@ -80,17 +122,21 @@ pi install git:github.com/<user>/cursor-context-extension@v0.1.0
 
 ## Custom tools (callable by the LLM)
 
+These tools are registered by the extension so the agent can drive doc maintenance deterministically:
+
 | Tool | Purpose |
 |---|---|
 | `context_refresh` | Compute current fingerprint, diff vs stored, return changed items + HEAD sha + fingerprint for re-stamping |
 | `context_benchmark` | Run the deterministic doc-quality gate (length, markers, command/path existence) |
 | `context_feedback` | Append a `wrong`/`gap` feedback signal for the evolve loop |
 
+The `context_feedback` tool's `type` param accepts `wrong` (doc stated something incorrect) or `gap` (doc omitted something that required real exploration).
+
 ## Environment flags (power users)
 
 | Flag | Effect |
 |---|---|
-| `CURSOR_CONTEXT_NO_METRICS=1` | Disable the metrics collector (PostToolUse logging) |
+| `CURSOR_CONTEXT_NO_METRICS=1` | Disable the metrics collector (`tool_call` logging) |
 | `CURSOR_CONTEXT_NO_EVOLVE=1` | Disable the evolve gate (no auto-trigger) |
 | `CURSOR_CONTEXT_NO_ONBOARD=1` | Disable auto-onboarding (no silent doc generation) |
 | `CURSOR_CONTEXT_BENCH=1` | Internal: marks a benchmark run so metrics aren't contaminated |
@@ -110,12 +156,12 @@ Priority rules are injected alongside everything: **live code beats the doc, and
 
 The extension learns from how it gets used (measure → reflect → mutate → select):
 
-- **Measure (deterministic, zero tokens)** — `tool_execution_end` logs tool usage to `.cursor-context/metrics.jsonl` (fields truncated, auto-rotated at 2,000 lines). Pure code: the LLM cannot bias its own measurements.
-- **Reflect (near-zero cost)** — a standing rule injected every turn: if the doc was wrong or missing something that required real exploration, the LLM logs one JSON line to `.cursor-context/context-feedback.jsonl` after finishing.
+- **Measure (deterministic, zero tokens)** — `tool_call` logs tool usage to `.cursor-context/harness-pi/metrics.jsonl` (fields truncated, auto-rotated at 2,000 lines). Pure code: the LLM cannot bias its own measurements. Captured at `tool_call` time (not `tool_execution_end`) because tool input is available only at call time, so intent is recorded even if a call is later blocked.
+- **Reflect (near-zero cost)** — a standing rule injected every turn: if the doc was wrong or missing something that required real exploration, the LLM logs one JSON line to `.cursor-context/harness-pi/context-feedback.jsonl` after finishing.
 - **Evolve (gated)** — once enough signal accumulates (5 feedback entries or 300 metric lines), `agent_end` sends a follow-up message that runs the `context-evolve` skill. The gate only triggers in TUI/RPC modes when the cwd is writable.
 - **Select (deterministic gate)** — before a new doc is adopted, `context-benchmark` lints it: line budget, marker/fingerprint validity, every mentioned `npm run`/`make` command must actually exist, mentioned paths should exist. **FAIL = the old doc is restored from backup.**
 
-Code-layer improvement ideas are only ever *proposed* (`.cursor-context/evolve-proposals.md`) — applying them is a human decision. Evolution history lives in `.cursor-context/evolve-log.jsonl`.
+Code-layer improvement ideas are only ever *proposed* (`.cursor-context/harness-pi/evolve-proposals.md`) — applying them is a human decision. Evolution history lives in `.cursor-context/harness-pi/evolve-log.jsonl`.
 
 ## Improvements over the original bash toolkit
 
@@ -134,7 +180,7 @@ This port fixes several issues identified during review of the original `cursor-
 |---|---|---|
 | session_start handler | <100 ms | <200 ms |
 | Per-prompt (before_agent_start) | ~30–50 ms (recompute fingerprint) | ~40–80 ms |
-| Per-tool (tool_execution_end) | <1 ms (in-process) | <1 ms |
+| Per-tool (tool_call) | <1 ms (in-process) | <1 ms |
 | Token cost when nothing changed | minimal ("verified fresh" line) | same |
 | Token cost when changed | alert + affected items list | same |
 
@@ -176,6 +222,14 @@ Remove the entry from `settings.json` `extensions`, or:
 ```bash
 rm -rf .cursor-context    # project-local data
 # remove the extension directory or settings entry
+```
+
+To disable a subsystem without uninstalling (e.g. in CI), set the relevant env flag instead:
+
+```bash
+export CURSOR_CONTEXT_NO_ONBOARD=1   # no silent doc generation
+export CURSOR_CONTEXT_NO_EVOLVE=1    # no auto evolve trigger
+export CURSOR_CONTEXT_NO_METRICS=1   # no usage logging
 ```
 
 ## License
