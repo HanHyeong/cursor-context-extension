@@ -1,0 +1,183 @@
+# cursor-context for pi
+
+**Cursor-grade automatic project context awareness for [pi](https://pi.dev).** Zero-touch, real-time, and honest about what it knows.
+
+A pi extension + 3 skills that recreate Cursor IDE's automatic project-context experience using pi's event system. The agent already knows your stack, structure, commands, and what your branch is working on *before* you type your first prompt — and the generated context doc stays fresh via content fingerprints compared against the live working tree.
+
+This is a port and redesign of the [cursor-context](https://github.com/HanHyeong/cursor-context) toolkit (originally built for Claude Code with bash hooks) to pi's extension model.
+
+| Cursor feature | This extension's counterpart |
+|---|---|
+| Background codebase index | `.cursor-context/project-context.md` — auto-generated doc, injected every session via `before_agent_start` |
+| Merkle-tree change detection | Content fingerprints compared against the **live working tree** |
+| Index refresh on save | 3-tier auto-refresh: on noticed discrepancy / on structural change / 20-commit backstop |
+| `.cursorrules` | `CLAUDE.md` / `AGENTS.md` — **user-owned, never touched** |
+| Per-query semantic code search | Delegated to pi's native agentic search (Grep/Glob/bash) |
+
+---
+
+## Install
+
+### From a local checkout
+
+```bash
+git clone <this-repo> cursor-context-extension
+cd cursor-context-extension
+npm install        # installs type-only devDeps
+```
+
+Then either:
+
+**Project-local** (per-project): add to `.pi/settings.json`:
+```json
+{
+  "extensions": ["/absolute/path/to/cursor-context-extension"]
+}
+```
+
+**Global** (all projects): add to `~/.pi/agent/settings.json`:
+```json
+{
+  "extensions": ["/absolute/path/to/cursor-context-extension"]
+}
+```
+
+**Or via `pi -e` for a quick test:**
+```bash
+pi -e /path/to/cursor-context-extension
+```
+
+### As a pi package (future)
+
+Once published to npm or a git tag:
+```bash
+pi install npm:pi-cursor-context
+# or
+pi install git:github.com/<user>/cursor-context-extension@v0.1.0
+```
+
+## What happens after install
+
+1. **Every session start** — the extension's `session_start` handler computes a freshness verdict and sets a footer status. On the first prompt, `before_agent_start` injects a compact snapshot:
+   - Detected stack (Node/Python/Go/Rust/Java/…), package manager, frameworks, npm scripts
+   - Directory tree (depth 2, tracked files)
+   - Git state: branch, recent commits, uncommitted changes
+   - **Branch intent**: `diff --stat` of your branch vs the default branch
+   - The generated project doc (markers stripped, ≤250 lines) plus a freshness verdict
+2. **On every prompt** — `before_agent_start` re-runs the (cheap) fingerprint comparison. If nothing changed, the doc section simply says "verified fresh" (minimal token cost). If something changed — even uncommitted edits, rollbacks, rebases, or branch switches — the agent is told exactly what differs, told not to trust the affected doc sections, and told to silently refresh after finishing.
+3. **No doc yet** — on the first substantive task (or when you ask about the project itself), the agent silently generates the doc via the `project-onboard` skill. Disable with `CURSOR_CONTEXT_NO_ONBOARD=1`.
+
+## Manual commands
+
+| Command | Description |
+|---|---|
+| `/context` | Show freshness status and signal counts |
+| `/context-onboard` | Force full doc regeneration (runs `project-onboard` skill) |
+| `/context-evolve` | Force an evolution pass (runs `context-evolve` skill) |
+| `/skill:project-onboard` | Run the onboarding skill directly |
+| `/skill:context-refresh` | Run an incremental refresh directly |
+| `/skill:context-evolve` | Run an evolution pass directly |
+
+## Custom tools (callable by the LLM)
+
+| Tool | Purpose |
+|---|---|
+| `context_refresh` | Compute current fingerprint, diff vs stored, return changed items + HEAD sha + fingerprint for re-stamping |
+| `context_benchmark` | Run the deterministic doc-quality gate (length, markers, command/path existence) |
+| `context_feedback` | Append a `wrong`/`gap` feedback signal for the evolve loop |
+
+## Environment flags (power users)
+
+| Flag | Effect |
+|---|---|
+| `CURSOR_CONTEXT_NO_METRICS=1` | Disable the metrics collector (PostToolUse logging) |
+| `CURSOR_CONTEXT_NO_EVOLVE=1` | Disable the evolve gate (no auto-trigger) |
+| `CURSOR_CONTEXT_NO_ONBOARD=1` | Disable auto-onboarding (no silent doc generation) |
+| `CURSOR_CONTEXT_BENCH=1` | Internal: marks a benchmark run so metrics aren't contaminated |
+
+## Freshness model (why you can trust what's injected)
+
+Staleness is judged by **content, not commit counts**. The doc stores sha256 fingerprints of structural files plus a directory-layout hash; the extension recomputes them against the working tree at session start and on every prompt.
+
+- Uncommitted manifest edits are caught immediately
+- Rebases, squash merges, hard resets, branch switches — all detected; rolling back to the documented state makes the fingerprint match again, so no wasted refresh
+- Scratch files inside existing directories do **not** trigger false "structure changed" alarms (only structural files and top-level directories are fingerprinted)
+- If verification is impossible (no structural files, no markers), the extension says so — it never claims "verified" when it isn't
+
+Priority rules are injected alongside everything: **live code beats the doc, and your `CLAUDE.md`/`AGENTS.md` beats both.**
+
+## Self-evaluation and evolution
+
+The extension learns from how it gets used (measure → reflect → mutate → select):
+
+- **Measure (deterministic, zero tokens)** — `tool_execution_end` logs tool usage to `.cursor-context/metrics.jsonl` (fields truncated, auto-rotated at 2,000 lines). Pure code: the LLM cannot bias its own measurements.
+- **Reflect (near-zero cost)** — a standing rule injected every turn: if the doc was wrong or missing something that required real exploration, the LLM logs one JSON line to `.cursor-context/context-feedback.jsonl` after finishing.
+- **Evolve (gated)** — once enough signal accumulates (5 feedback entries or 300 metric lines), `agent_end` sends a follow-up message that runs the `context-evolve` skill. The gate only triggers in TUI/RPC modes when the cwd is writable.
+- **Select (deterministic gate)** — before a new doc is adopted, `context-benchmark` lints it: line budget, marker/fingerprint validity, every mentioned `npm run`/`make` command must actually exist, mentioned paths should exist. **FAIL = the old doc is restored from backup.**
+
+Code-layer improvement ideas are only ever *proposed* (`.cursor-context/evolve-proposals.md`) — applying them is a human decision. Evolution history lives in `.cursor-context/evolve-log.jsonl`.
+
+## Improvements over the original bash toolkit
+
+This port fixes several issues identified during review of the original `cursor-context`:
+
+1. **Single fingerprint source** — the bash version re-implemented fingerprint comparison in `session-context.sh`, `prompt-freshness.sh`, and `context-benchmark.sh`. This port centralizes all fingerprint logic in `src/git.ts` (`computeFingerprint` / `diffFingerprints` / `freshnessVerdict`); hooks and skills call it. No drift risk.
+2. **No per-tool python3 spawn** — the bash `metrics-collector.sh` started a python3 interpreter on every PostToolUse call (~15–30 ms each, hundreds of times per long session). This port writes a single JSON line via `fs.appendFileSync` in-process (sub-millisecond).
+3. **Honest evolve gate** — the bash `evolve-gate.sh` used `exit 2` to block turn end, claimed as "deterministic enforcement". In practice it relied on the model complying with "skip in plan mode" instructions. This port checks `ctx.mode` and cwd writeability directly, and uses a follow-up message (honest about being non-blocking) rather than pretending to block. The bash version's `0\n0` counting bug (worked around with awk) is also eliminated by a wc-free line counter.
+4. **Accurate framework detection** — the bash version used `grep -q "\"$fw\"" package.json`, so `next` matched `next-auth`. This port matches manifest keys (`"${fw}"\s*:`), fixing the false positive.
+5. **Typed freshness state** — the bash version used exit code 3 to mean "unverifiable", conflating "no hash tool" with "no markers". This port uses a discriminated union (`fresh` / `stale` / `unverifiable` / `no-doc`), making "can't verify" an honest first-class state.
+6. **Cross-platform by default** — no `sha256sum` vs `shasum` fallback needed; Node's `crypto` module provides sha256 everywhere pi runs.
+
+## Overhead
+
+| Metric | Small project | Large project |
+|---|---|---|
+| session_start handler | <100 ms | <200 ms |
+| Per-prompt (before_agent_start) | ~30–50 ms (recompute fingerprint) | ~40–80 ms |
+| Per-tool (tool_execution_end) | <1 ms (in-process) | <1 ms |
+| Token cost when nothing changed | minimal ("verified fresh" line) | same |
+| Token cost when changed | alert + affected items list | same |
+
+Scaling is dominated by `git ls-files`, so even 50k-file monorepos stay well under a second.
+
+## Coexistence with the Claude Code bash toolkit
+
+Both this extension and the original [cursor-context](https://github.com/HanHyeong/cursor-context)
+bash toolkit (built for Claude Code) write inside the same `.cursor-context/`
+directory. That is intentional and safe by design:
+
+| Path | Shared? | Why |
+|---|---|---|
+| `project-context.md` | **shared** | Describes the project, not the harness; marker/fingerprint format is identical so either side can refresh and the other reads it as fresh |
+| `backup/` | **shared** | Timestamped subdirs (`evolve-<ts>/`) never collide |
+| `harness-pi/metrics.jsonl` | pi only | Usage is measured per-harness to avoid double-counting toward the evolve threshold |
+| `harness-pi/context-feedback.jsonl` | pi only | Same reason — one harness's `consumeSignals` must not wipe the other's data |
+| `harness-pi/evolve-log.jsonl` | pi only | Per-harness evolution history |
+| `harness-pi/evolve-proposals.md` | pi only | Per-harness proposals |
+| `metrics.jsonl` (root), `context-feedback.jsonl` (root), … | Claude Code only | The bash toolkit keeps its legacy root paths untouched |
+
+On the first pi session in a project that previously only used the bash toolkit,
+`session_start` idempotently migrates any legacy root-level `metrics.jsonl` /
+`context-feedback.jsonl` into `harness-pi/` so prior signal isn't lost. The bash
+toolkit is never modified.
+
+## Safety guarantees
+
+- `CLAUDE.md` / `AGENTS.md` are strictly user-owned: read, never written
+- Auto-generated/refreshed files are left **uncommitted** for review (auto-added to `.gitignore`)
+- All hooks degrade gracefully: missing files, missing git, unwritable dirs → the extension says so honestly and continues
+- Extension config via env flags is purely additive — disabling a feature never breaks the rest
+- Coexistence with the bash toolkit is non-destructive: pi never touches the bash toolkit's root log paths, and migration is a one-time idempotent move with a fallback to copy+truncate if the root file is held open
+
+## Uninstall
+
+Remove the entry from `settings.json` `extensions`, or:
+
+```bash
+rm -rf .cursor-context    # project-local data
+# remove the extension directory or settings entry
+```
+
+## License
+
+MIT

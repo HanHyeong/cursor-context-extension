@@ -1,0 +1,22 @@
+{
+  "name": "pi-cursor-context",
+  "version": "0.1.0",
+  "description": "Cursor-grade automatic project context awareness for pi. Zero-touch, real-time, honest about what it knows.",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi-extension"],
+  "type": "module",
+  "pi": {
+    "extensions": ["./src/index.ts"],
+    "skills": ["./skills"]
+  },
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "echo 'nothing to build (loaded via jiti)'",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*",
+    "typescript": "^5.5.0"
+  }
+}
