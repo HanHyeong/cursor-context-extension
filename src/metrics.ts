@@ -11,7 +11,7 @@
  *    fs.appendFileSync, which is sub-millisecond and allocation-light.
  *  - Evolve gate is gated on `ctx.mode` and a write-writeability heuristic
  *    rather than relying solely on injected instructions the model may
- *    ignore: in plan/print/json mode the gate never blocks, and the gate
+ *    ignore: in print/json mode the gate never blocks, and the gate
  *    only blocks when the cwd is actually writable. This removes the
  *    original's reliance on model compliance for the "skip in inappropriate
  *    sessions" rule.
@@ -19,7 +19,7 @@
  *    bash version had to work around with awk.
  */
 
-import { appendFileSync, mkdirSync, readFileSync, existsSync, renameSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, existsSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 import {
@@ -139,7 +139,9 @@ function maybeRotate(path: string): void {
 	if (lines.length > METRICS_ROTATE_AT + 1) {
 		const kept = lines.filter(Boolean).slice(-METRICS_KEEP_AFTER_ROTATE);
 		try {
-			appendFileSync(`${path}.tmp`, kept.join("\n") + "\n");
+			// writeFileSync (not append): a stale .tmp left by a previously
+			// failed rename must be overwritten, not extended with duplicates.
+			writeFileSync(`${path}.tmp`, kept.join("\n") + "\n");
 			renameSync(`${path}.tmp`, path);
 		} catch {
 			// best-effort; don't disrupt the active session

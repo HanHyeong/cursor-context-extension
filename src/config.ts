@@ -87,6 +87,25 @@ export const COMMIT_BACKSTOP = 20;
 export const EVOLVE_FEEDBACK_THRESHOLD = 5;
 export const EVOLVE_METRICS_THRESHOLD = 300;
 
+/**
+ * Auto-onboard trigger: how many exploration tool calls (read/grep/find/ls/
+ * bash) make a session "substantive" enough to persist its knowledge as the
+ * context doc, even when no edit/write happened (question-only or bash-only
+ * sessions). Low enough to catch real project questions, high enough to skip
+ * trivial one-file lookups.
+ */
+export const ONBOARD_EXPLORATION_THRESHOLD = 5;
+
+/** Auto-onboard trigger: max follow-up attempts per session (bounded retry). */
+export const ONBOARD_MAX_ATTEMPTS = 2;
+
+/**
+ * Tools that count as "exploration" for the auto-onboard trigger. Single
+ * source of truth so the signal classifier and any future consumer cannot
+ * drift apart (pi built-ins: bash/read/edit/write/grep/find/ls).
+ */
+export const EXPLORATION_TOOLS: ReadonlySet<string> = new Set(["read", "grep", "find", "ls", "bash"]);
+
 /** Metrics log rotation: keep last this many lines when exceeding the cap. */
 export const METRICS_ROTATE_AT = 2000;
 export const METRICS_KEEP_AFTER_ROTATE = 1000;

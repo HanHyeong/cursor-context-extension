@@ -22,7 +22,7 @@ The extension is a single TypeScript module (`src/index.ts`) loaded via [jiti](h
 
 | Module | Role |
 |---|---|
-| `src/index.ts` | Extension entry: event handlers (`session_start`, `before_agent_start`, `tool_call`, `agent_end`), custom tools, commands |
+| `src/index.ts` | Extension entry: event handlers (`session_start`, `before_agent_start`, `tool_call`, `tool_result`, `agent_end`), custom tools, commands |
 | `src/config.ts` | Constants, paths, env-flag options, legacy-log migration |
 | `src/git.ts` | Single source of truth for fingerprinting, git/fs helpers, freshness verdict |
 | `src/snapshot.ts` | Project-context snapshot builder (stack/tree/git/branch-intent) |
@@ -40,7 +40,8 @@ The extension is a single TypeScript module (`src/index.ts`) loaded via [jiti](h
 | SessionStart | `session_start` | Compute freshness, set footer status, ensure `.gitignore`, migrate legacy logs |
 | UserPromptSubmit | `before_agent_start` | Inject snapshot + freshness verdict + standing rules (per prompt) |
 | PostToolUse | `tool_call` | Append tool-usage metric (in-process, sub-ms) |
-| Stop (evolve gate) | `agent_end` | If signals cross threshold, send follow-up message triggering evolve |
+| PostToolUse | `tool_result` | Track code-change/exploration signals for auto-onboard (non-error results only, so blocked/failed edits don't count) |
+| Stop (evolve gate) | `agent_end` | No doc + substantive session → follow-up triggering onboard; signals over threshold → follow-up triggering evolve |
 
 ### Freshness verdict (single source of truth)
 
@@ -55,6 +56,21 @@ type FreshnessVerdict =
 ```
 
 Both the `session_start` cache and the per-prompt `before_agent_start` recompute call this. No drift risk — the bash version re-implemented the comparison in 3 scripts.
+
+## Platform support
+
+Developed and runtime-verified on macOS (real `pi` sessions, both `-p` and
+`--mode rpc`, driving the actual onboard/freshness flow end to end). Linux is
+expected to work identically — same `git` CLI, same Node `crypto` module,
+same POSIX paths — but has not been separately verified.
+
+**Windows is untested.** The code is written to avoid the classic
+`path.sep`-based bug: directory-structure hashing and the directory-tree
+snapshot split paths on `"/"` rather than `path.sep`, because `git ls-files`
+always emits forward slashes regardless of OS (see `src/git.ts`). So it is
+*expected* to behave correctly, but nobody has actually run this extension on
+Windows. Treat freshness detection as unverified there until someone confirms
+it — please file an issue with what you find either way.
 
 ## Install
 
@@ -107,7 +123,7 @@ pi install git:github.com/<user>/cursor-context-extension@v0.1.0
    - **Branch intent**: `diff --stat` of your branch vs the default branch
    - The generated project doc (markers stripped, ≤250 lines) plus a freshness verdict
 2. **On every prompt** — `before_agent_start` re-runs the (cheap) fingerprint comparison. If nothing changed, the doc section simply says "verified fresh" (minimal token cost). If something changed — even uncommitted edits, rollbacks, rebases, or branch switches — the agent is told exactly what differs, told not to trust the affected doc sections, and told to silently refresh after finishing.
-3. **No doc yet** — on the first substantive task (or when you ask about the project itself), the agent silently generates the doc via the `project-onboard` skill. Disable with `CURSOR_CONTEXT_NO_ONBOARD=1`.
+3. **No doc yet** — on the first substantive task (or when you ask about the project itself), the agent silently generates the doc via the `project-onboard` skill. A deterministic backstop fires at turn end: if no doc exists and the session changed code (edit/write), a follow-up message forces the generation, retried once more if the first attempt doesn't produce a doc (max 2 attempts). If the session instead only did enough exploration (5+ read/grep/find/ls/bash calls, no edits — e.g. a question-only session), one follow-up fires but may be legitimately declined (e.g. pure code review), so it is not retried. Interactive TUI/RPC sessions only — `print`/`json` one-shot modes never auto-generate. Disable with `CURSOR_CONTEXT_NO_ONBOARD=1`.
 
 ## Manual commands
 
@@ -126,8 +142,10 @@ These tools are registered by the extension so the agent can drive doc maintenan
 
 | Tool | Purpose |
 |---|---|
-| `context_refresh` | Compute current fingerprint, diff vs stored, return changed items + HEAD sha + fingerprint for re-stamping |
+| `context_write_doc` | Write the doc from a markdown body — markers (HEAD sha + fingerprint block) are stamped deterministically and `.cursor-context/` is gitignored; the model never hand-writes the header |
+| `context_refresh` | Compute current fingerprint, diff vs stored, return changed items + HEAD sha (stamping itself is `context_write_doc`'s job) |
 | `context_benchmark` | Run the deterministic doc-quality gate (length, markers, command/path existence) |
+| `context_evolve_checkpoint` | Backup the doc before an evolve rewrite, restore it on a gate FAIL, and consume signal logs once the outcome is decided |
 | `context_feedback` | Append a `wrong`/`gap` feedback signal for the evolve loop |
 
 The `context_feedback` tool's `type` param accepts `wrong` (doc stated something incorrect) or `gap` (doc omitted something that required real exploration).
@@ -139,7 +157,10 @@ The `context_feedback` tool's `type` param accepts `wrong` (doc stated something
 | `CURSOR_CONTEXT_NO_METRICS=1` | Disable the metrics collector (`tool_call` logging) |
 | `CURSOR_CONTEXT_NO_EVOLVE=1` | Disable the evolve gate (no auto-trigger) |
 | `CURSOR_CONTEXT_NO_ONBOARD=1` | Disable auto-onboarding (no silent doc generation) |
-| `CURSOR_CONTEXT_BENCH=1` | Internal: marks a benchmark run so metrics aren't contaminated |
+| `CURSOR_CONTEXT_BENCH=1` | Internal: marks a benchmark run so metrics aren't contaminated (does not affect onboard/evolve triggering) |
+
+The `NO_*` flags are read once when the extension loads — changing them
+mid-session has no effect; restart pi.
 
 ## Freshness model (why you can trust what's injected)
 
@@ -148,6 +169,7 @@ Staleness is judged by **content, not commit counts**. The doc stores sha256 fin
 - Uncommitted manifest edits are caught immediately
 - Rebases, squash merges, hard resets, branch switches — all detected; rolling back to the documented state makes the fingerprint match again, so no wasted refresh
 - Scratch files inside existing directories do **not** trigger false "structure changed" alarms (only structural files and top-level directories are fingerprinted)
+- Untracked files under `.cursor-context/` are excluded from the fingerprint, so generating the doc (or gitignoring the directory afterwards) can never mark the doc stale on its own; tracked files there (team-share mode) still count, keeping the hash comparable with the coexisting bash toolkit
 - If verification is impossible (no structural files, no markers), the extension says so — it never claims "verified" when it isn't
 
 Priority rules are injected alongside everything: **live code beats the doc, and your `CLAUDE.md`/`AGENTS.md` beats both.**
@@ -172,7 +194,7 @@ This port fixes several issues identified during review of the original `cursor-
 3. **Honest evolve gate** — the bash `evolve-gate.sh` used `exit 2` to block turn end, claimed as "deterministic enforcement". In practice it relied on the model complying with "skip in plan mode" instructions. This port checks `ctx.mode` and cwd writeability directly, and uses a follow-up message (honest about being non-blocking) rather than pretending to block. The bash version's `0\n0` counting bug (worked around with awk) is also eliminated by a wc-free line counter.
 4. **Accurate framework detection** — the bash version used `grep -q "\"$fw\"" package.json`, so `next` matched `next-auth`. This port matches manifest keys (`"${fw}"\s*:`), fixing the false positive.
 5. **Typed freshness state** — the bash version used exit code 3 to mean "unverifiable", conflating "no hash tool" with "no markers". This port uses a discriminated union (`fresh` / `stale` / `unverifiable` / `no-doc`), making "can't verify" an honest first-class state.
-6. **Cross-platform by default** — no `sha256sum` vs `shasum` fallback needed; Node's `crypto` module provides sha256 everywhere pi runs.
+6. **Cross-platform hashing** — no `sha256sum` vs `shasum` fallback needed; Node's `crypto` module provides sha256 everywhere pi runs. This covers hashing only, not the whole extension — see [Platform support](#platform-support) for the untested-on-Windows caveat.
 
 ## Overhead
 
@@ -210,7 +232,7 @@ toolkit is never modified.
 ## Safety guarantees
 
 - `CLAUDE.md` / `AGENTS.md` are strictly user-owned: read, never written
-- Auto-generated/refreshed files are left **uncommitted** for review (auto-added to `.gitignore`)
+- Auto-generated/refreshed files are left **uncommitted** for review (auto-added to `.gitignore`; skipped when the doc is deliberately committed — team-share mode)
 - All hooks degrade gracefully: missing files, missing git, unwritable dirs → the extension says so honestly and continues
 - Extension config via env flags is purely additive — disabling a feature never breaks the rest
 - Coexistence with the bash toolkit is non-destructive: pi never touches the bash toolkit's root log paths, and migration is a one-time idempotent move with a fallback to copy+truncate if the root file is held open

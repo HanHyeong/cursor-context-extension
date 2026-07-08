@@ -74,43 +74,32 @@ changes without signal is anti-improvement.
 
 ### 3. Backup — always before rewriting
 
-This doc is usually gitignored, so git can't restore it. Self-backup is the only
-rollback path:
-
-```bash
-mkdir -p .cursor-context/backup/evolve-$(date +%Y%m%d%H%M%S)
-cp .cursor-context/project-context.md .cursor-context/backup/evolve-<ts>/
-```
-
-(The extension's `backupDoc` helper does this; if writing by hand, match the
-timestamp-dir convention.)
+This doc is usually gitignored, so git can't restore it. Self-backup is the
+only rollback path. Call `context_evolve_checkpoint` with `step: "backup"` —
+it snapshots the doc to `.cursor-context/backup/evolve-<ts>/` and returns `ts`
+and `backupPath`. Keep both; you'll need them in steps 4 and 5.
 
 ### 4. Baseline score → rewrite → gate
 
 Call the `context_benchmark` tool to record the baseline PASS count, then
-rewrite the doc (follow `project-onboard`'s writing principles; re-stamp
-markers), then call `context_benchmark` again.
+rewrite the doc via the `context_write_doc` tool (follow `project-onboard`'s
+writing principles; the tool stamps the markers), then call `context_benchmark`
+again.
 
 **Adoption condition: new doc FAIL=0 AND PASS count ≥ baseline PASS count.**
-On failure, restore from backup and log the rejection reason. Never modify the
-gate to pass — that's rule 1.
+On failure, call `context_evolve_checkpoint` with `step: "restore"` and the
+`backupPath` from step 3, and log the rejection reason (step 5). Never modify
+the gate to pass — that's rule 1.
 
 ### 5. Consume signals and log
 
 Whether adopted or not, consume the processed signals (otherwise every session
-re-triggers evolve). Consume **only this harness's** scoped files — never the
-legacy root logs, which belong to the Claude Code toolkit:
-
-```bash
-mv .cursor-context/harness-pi/context-feedback.jsonl .cursor-context/backup/evolve-<ts>/ 2>/dev/null
-mv .cursor-context/harness-pi/metrics.jsonl .cursor-context/backup/evolve-<ts>/ 2>/dev/null
-```
-
-And append one line to `.cursor-context/harness-pi/evolve-log.jsonl`:
-
-```json
-{"ts":<epoch>, "accepted":true|false, "before_pass":N, "after_pass":M, "changes":"one-line summary", "reject_reason":null|"..."}
-```
+re-triggers evolve) by calling `context_evolve_checkpoint` with
+`step: "finalize"`, the **same `ts`** from step 3's backup call, and
+`accepted`/`beforePass`/`afterPass`/`changes`/`rejectReason` describing the
+outcome. This moves this harness's scoped signal files (feedback + metrics —
+never the legacy root logs, which belong to the Claude Code toolkit) into the
+`evolve-<ts>/` backup dir and appends one line to `evolve-log.jsonl`.
 
 ## Auto-invocation mode (silently triggered by the extension)
 

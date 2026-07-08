@@ -171,7 +171,7 @@ export function buildFreshnessAlert(changed: readonly string[]): string {
 	);
 	for (const c of changed) L.push(`- ${c}`);
 	L.push(
-		"Do not trust doc sections related to these items (commands, stack, structure) during this request — verify against actual files. After finishing the user's request, silently refresh the affected doc sections using the context-refresh skill. Skip refresh in read-only or plan-mode sessions. Never modify CLAUDE.md / AGENTS.md.",
+		"Do not trust doc sections related to these items (commands, stack, structure) during this request — verify against actual files. After finishing the user's request, silently refresh the affected doc sections using the context-refresh skill. Skip refresh in read-only or print sessions. Never modify CLAUDE.md / AGENTS.md.",
 	);
 	L.push("</context-freshness-alert>");
 	return L.join("\n");

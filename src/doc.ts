@@ -10,7 +10,7 @@ import { writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
 import { CONTEXT_FILE, type FingerprintEntry } from "./config.js";
-import { renderFingerprintBlock, headSha, run, fileExists, readText } from "./git.js";
+import { renderFingerprintBlock, run, readText } from "./git.js";
 import { docHeader } from "./snapshot.js";
 
 /** Write the doc (header markers + body). Creates `.cursor-context/` if needed. */
@@ -23,6 +23,11 @@ export function writeDoc(cwd: string, body: string, sha: string, fingerprint: re
 
 /** Ensure `.cursor-context/` is gitignored (idempotent, non-destructive). */
 export async function ensureGitignored(cwd: string): Promise<void> {
+	// Team-share mode: if the doc itself is tracked, the team committed it on
+	// purpose (and removed the ignore line) — do not fight that decision by
+	// re-adding the line every session/write.
+	const tracked = await run("git", ["ls-files", "--", CONTEXT_FILE], { cwd });
+	if (tracked.code === 0 && tracked.stdout.trim()) return;
 	const gi = join(cwd, ".gitignore");
 	let cur = "";
 	if (existsSync(gi)) cur = (await readText(gi)) ?? "";
@@ -54,12 +59,4 @@ export async function verifyCommand(
 export async function tryRun(cwd: string, cmd: string, args: readonly string[]): Promise<boolean> {
 	const r = await run(cmd, args, { cwd, timeout: 15_000 });
 	return r.code === 0;
-}
-
-/** Read the current doc body (without markers), or undefined if absent. */
-export async function readDocBody(cwd: string): Promise<string | undefined> {
-	const { stripMarkers } = await import("./git.js");
-	const doc = await readText(join(cwd, CONTEXT_FILE));
-	if (!doc) return undefined;
-	return stripMarkers(doc);
 }

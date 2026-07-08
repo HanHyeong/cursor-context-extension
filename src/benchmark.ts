@@ -65,7 +65,7 @@ export async function benchmark(cwd: string): Promise<BenchmarkResult> {
 		else {
 			const changed = diffFingerprints(stored, current);
 			if (changed.length === 0) ok();
-			else fail_(`fingerprint mismatch — re-stamp markers (changed: ${changed.join(", ")})`);
+			else fail_(`fingerprint mismatch — rewrite via context_write_doc to re-stamp (changed: ${changed.join(", ")})`);
 		}
 	}
 

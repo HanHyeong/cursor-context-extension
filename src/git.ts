@@ -15,11 +15,12 @@
 import { createHash } from "node:crypto";
 import { readFile, access, readdir, stat } from "node:fs/promises";
 import { constants as FS } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { join, relative } from "node:path";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
 
 import {
+	CONTEXT_DIR,
 	STRUCTURAL_FILES,
 	MARKER_FP_BEGIN,
 	MARKER_FP_END,
@@ -246,11 +247,24 @@ export async function computeFingerprint(cwd: string): Promise<readonly Fingerpr
 	}
 
 	// Directory-structure hash: depth-1 dirs + depth-2 dirs that have depth-3+ files.
+	// git ls-files always emits "/" separators regardless of platform, so split
+	// on "/" (not path.sep — on Windows that would treat every path as depth-1
+	// and turn the hash into a full-file-list hash, causing false stale alarms).
 	if (await isGitRepo(cwd)) {
-		const files = await lsAllFiles(cwd);
+		const [tracked, files] = await Promise.all([lsFiles(cwd), lsAllFiles(cwd)]);
+		const trackedSet = new Set(tracked);
 		const dirs = new Set<string>();
 		for (const f of files) {
-			const parts = f.split(sep);
+			const parts = f.split("/");
+			// Exclude UNTRACKED files under the context dir: before it is
+			// gitignored (first generation, or metrics arriving ahead of the
+			// doc) they are untracked-but-not-ignored, so including them would
+			// make the doc invalidate its own fingerprint the moment it (or
+			// the gitignore entry) is created. TRACKED files under it (team-
+			// share mode commits the doc) stay included: they are stable and
+			// the coexisting bash toolkit sees them too, keeping the hashes
+			// comparable across harnesses.
+			if (parts[0] === CONTEXT_DIR && !trackedSet.has(f)) continue;
 			if (parts.length >= 2) dirs.add(parts[0]!);
 			if (parts.length >= 3) dirs.add(`${parts[0]}/${parts[1]}`);
 		}
@@ -363,7 +377,8 @@ export async function directoryTree(cwd: string, maxLines: number): Promise<{ li
 		const files = await lsFiles(cwd);
 		const dirs = new Set<string>();
 		for (const f of files) {
-			const parts = f.split(sep);
+			// git ls-files emits "/" on every platform — do not use path.sep.
+			const parts = f.split("/");
 			if (parts.length === 1) dirs.add(parts[0]!);
 			else dirs.add(`${parts[0]}/${parts[1]}${parts.length > 2 ? "/…" : ""}`);
 		}
@@ -413,6 +428,16 @@ export async function npmScripts(cwd: string): Promise<readonly [string, string]
 export async function fileExists(path: string): Promise<boolean> {
 	try {
 		await stat(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Whether a path is writable (single source for the trigger gates). */
+export async function isWritable(path: string): Promise<boolean> {
+	try {
+		await access(path, FS.W_OK);
 		return true;
 	} catch {
 		return false;
